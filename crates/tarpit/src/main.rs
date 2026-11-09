@@ -518,5 +518,6 @@ fn data_owner_name(owner: DataOwner) -> &'static str {
         DataOwner::Gnu(GnuKind::LongName) => "gnu(long-name)",
         DataOwner::Gnu(GnuKind::LongLink) => "gnu(long-link)",
         DataOwner::Member => "member",
+        DataOwner::SparseMap => "sparse-map",
     }
 }

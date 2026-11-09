@@ -27,6 +27,7 @@
 //!     state "AwaitingHeader" as PosixBoundary
 //!     state PosixHeader <<choice>>
 //!     state "ReadingMember" as PosixMemberData
+//!     state "ReadingSparseMap" as PosixSparseMap
 //!
 //!     PosixBoundary --> PosixHeader: next header
 //!     PosixHeader --> ReadingPax: x or g
@@ -36,6 +37,9 @@
 //!     ReadingPax --> PosixBoundary: global g payload complete
 //!     AwaitingUstarHeader --> PosixMemberData: member data
 //!     AwaitingUstarHeader --> PosixBoundary: empty member
+//!     AwaitingUstarHeader --> PosixSparseMap: sparse 1.0 member
+//!     PosixSparseMap --> PosixMemberData: map complete
+//!     PosixSparseMap --> PosixBoundary: map complete, no data
 //!     PosixMemberData --> PosixBoundary: payload complete
 //!   }
 //!
@@ -44,6 +48,7 @@
 //!     state "AwaitingHeader" as GnuBoundary
 //!     state GnuHeader <<choice>>
 //!     state "ReadingMember" as GnuMemberData
+//!     state "ReadingSparseMap" as GnuSparseMap
 //!
 //!     GnuBoundary --> GnuHeader: next header
 //!     GnuHeader --> ReadingGnu: nonempty L or K
@@ -53,6 +58,10 @@
 //!     AwaitingGnuMember --> ReadingGnu: nonempty extension of the other kind
 //!     AwaitingGnuMember --> GnuMemberData: member data
 //!     AwaitingGnuMember --> GnuBoundary: empty member
+//!     GnuHeader --> GnuSparseMap: extended S member
+//!     AwaitingGnuMember --> GnuSparseMap: extended S member
+//!     GnuSparseMap --> GnuMemberData: map complete
+//!     GnuSparseMap --> GnuBoundary: map complete, no data
 //!     GnuMemberData --> GnuBoundary: payload complete
 //!   }
 //!
@@ -86,9 +95,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
-    DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
-    GnuKind, PaxError, PaxExtension, PaxKeyword, PaxKind, PaxRecord, PaxState, PaxValue,
-    TrailingDataPolicy, UstarKind,
+    DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_GNU_SPARSE_MAP_SIZE,
+    DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind, PaxError, PaxExtension,
+    PaxKeyword, PaxKind, PaxRecord, PaxState, PaxValue, TrailingDataPolicy, UstarKind,
     header::{
         CHECKSUM_RANGE, GID_RANGE, GNAME_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE,
         MODE_RANGE, MTIME_RANGE, NAME_RANGE, NumericFormat, PREFIX_RANGE, SIZE_RANGE,
@@ -96,6 +105,9 @@ use crate::{
         parse_octal,
     },
     pax::{GlobalPaxRecords, PaxRecords, SharedPaxRecords},
+    sparse::{
+        PendingSparseMap, SharedSparseMap, SparseHeader, SparseMap, SparseProgress, sparse_record,
+    },
 };
 
 /// Represents a single non-terminator physical block in a tar stream.
@@ -158,12 +170,22 @@ pub struct HeaderFrame {
     /// This is also the number of payload bytes for which data frames will be
     /// emitted. Member kinds that cannot carry payload are rejected when either
     /// their declared or effective size is nonzero.
+    ///
+    /// For a pax 1.0 sparse member, this includes the sparse map at the start of
+    /// the payload. An old GNU sparse member's extension blocks are not part of
+    /// its payload, but are also emitted as [`DataOwner::SparseMap`] data frames
+    /// before the payload.
     pub effective_size: u64,
     pub(crate) mode: Option<u64>,
     pub(crate) uid: Option<u64>,
     pub(crate) gid: Option<u64>,
     pub(crate) mtime: Option<u64>,
+    /// A sparse map completed by this header.
+    pub(crate) sparse_map: Option<SharedSparseMap>,
 }
+
+/// A header frame and any sparse map that continues after it.
+type HeaderWithSparseMap = (HeaderFrame, Option<PendingSparseMap>);
 
 impl HeaderFrame {
     fn ustar(
@@ -173,14 +195,14 @@ impl HeaderFrame {
         local_records: Option<&PaxRecords>,
         global_records: &GlobalPaxRecords,
         policy: &StreamPolicy,
-    ) -> Result<Self, FrameError> {
+    ) -> Result<HeaderWithSparseMap, FrameError> {
         // A local `linkpath` can supply a target or, if empty, suppress the global
         // target for this member.
         let has_linkpath = matches!(
             PaxState::effective_record_from(local_records, global_records, &PaxKeyword::LinkPath),
             Some(PaxRecord::LinkPath(PaxValue::Value(_)))
         );
-        let kind = UstarKind::from_header(position, &block, has_linkpath)?;
+        let kind = UstarKind::from_header(position, &block, block[TYPEFLAG_OFFSET], has_linkpath)?;
 
         // Some real-world pax writers encode absent ordinary-header metadata as
         // all NULs. The compatibility policy may accept these empty fields; every
@@ -220,6 +242,20 @@ impl HeaderFrame {
         )?;
         validate_pax_member_size(position, kind, declared_size, effective_size, policy)?;
 
+        // GNU sparse records are ordinary vendor records unless sparse
+        // decoding is enabled.
+        let sparse = if policy.allow_gnu_sparse {
+            SparseHeader::pax(position, local_records, effective_size)?
+        } else {
+            None
+        };
+        if sparse.is_some() && !matches!(block[TYPEFLAG_OFFSET], 0 | b'0') {
+            return Err(FrameError::invalid_sparse_map(
+                position,
+                "sparse member is not a regular file",
+            ));
+        }
+
         Ok(Self {
             position,
             block,
@@ -231,7 +267,9 @@ impl HeaderFrame {
             uid,
             gid,
             mtime,
-        })
+            sparse_map: None,
+        }
+        .with_sparse_header(sparse))
     }
 
     fn gnu(
@@ -240,8 +278,16 @@ impl HeaderFrame {
         declared_size: u64,
         has_long_link: bool,
         policy: &StreamPolicy,
-    ) -> Result<Self, FrameError> {
-        let kind = UstarKind::from_header(position, &block, has_long_link)?;
+    ) -> Result<HeaderWithSparseMap, FrameError> {
+        // An old GNU sparse member is a regular file whose payload is mapped
+        // into the expanded file.
+        let is_sparse = policy.allow_gnu_sparse && block[TYPEFLAG_OFFSET] == b'S';
+        let typeflag = if is_sparse {
+            b'0'
+        } else {
+            block[TYPEFLAG_OFFSET]
+        };
+        let kind = UstarKind::from_header(position, &block, typeflag, has_long_link)?;
         validate_gnu_member_size(position, kind, declared_size)?;
         let parse_numeric_field = |field, range: Range<usize>| {
             Self::parse_numeric_field(
@@ -257,6 +303,9 @@ impl HeaderFrame {
         let gid = parse_numeric_field("gid", GID_RANGE)?;
         let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
         Self::validate_owner_names(position, &block, policy)?;
+        let sparse = is_sparse
+            .then(|| SparseHeader::old_gnu(position, &block, declared_size))
+            .transpose()?;
 
         Ok(Self {
             position,
@@ -269,7 +318,29 @@ impl HeaderFrame {
             uid,
             gid,
             mtime,
-        })
+            sparse_map: None,
+        }
+        .with_sparse_header(sparse))
+    }
+
+    fn with_sparse_header(mut self, sparse: Option<SparseHeader>) -> HeaderWithSparseMap {
+        match sparse {
+            Some(SparseHeader::Complete(map)) => {
+                self.sparse_map = Some(Arc::new(map));
+                (self, None)
+            }
+            Some(SparseHeader::Pending(map)) => (self, Some(map)),
+            None => (self, None),
+        }
+    }
+
+    /// Returns the sparse map completed by this header, if any.
+    ///
+    /// An old GNU sparse map without extension blocks and a pax 0.1 sparse map
+    /// are completed by their member header. Other sparse maps are completed by
+    /// their final [`DataOwner::SparseMap`] data frame.
+    pub fn sparse_map(&self) -> Option<&SparseMap> {
+        self.sparse_map.as_deref()
     }
 
     fn validate_owner_names(
@@ -347,6 +418,11 @@ pub enum DataOwner {
     Gnu(GnuKind),
     /// Payload bytes belonging to an ordinary archive member.
     Member,
+    /// GNU sparse map bytes belonging to the preceding ordinary member.
+    ///
+    /// These are old GNU sparse extension blocks, or a pax 1.0 sparse map at
+    /// the start of the member payload.
+    SparseMap,
 }
 
 /// A payload physical block.
@@ -368,6 +444,8 @@ pub struct DataFrame {
     /// This is `Some` only for the last data block belonging to a local or
     /// global pax header; other payload data carries `None`.
     pub(super) completed_pax_extension: Option<PaxExtension>,
+    /// The sparse map completed by this final sparse map block.
+    pub(super) completed_sparse_map: Option<SharedSparseMap>,
 }
 
 impl DataFrame {
@@ -379,6 +457,14 @@ impl DataFrame {
         self.completed_pax_extension
             .as_ref()
             .map(PaxExtension::records)
+    }
+
+    /// Returns the sparse map completed by this final sparse map block.
+    ///
+    /// This returns `Some` only for the last [`DataOwner::SparseMap`] block of
+    /// a member.
+    pub fn completed_sparse_map(&self) -> Option<&SparseMap> {
+        self.completed_sparse_map.as_deref()
     }
 }
 
@@ -404,6 +490,11 @@ pub(super) enum State {
     },
     /// GNU extension is pending; accept another distinct extension or its member.
     AwaitingGnuMember { pending: PendingGnu },
+    /// Consume the GNU sparse map blocks that precede an ordinary member's data.
+    ReadingSparseMap {
+        header_position: u64,
+        map: PendingSparseMap,
+    },
     /// Consume the payload blocks declared for an ordinary member.
     ReadingMember { remaining: u64 },
     /// The first zero end marker was read; require the second zero block.
@@ -452,6 +543,8 @@ pub struct StreamPolicy {
     allow_pax_base256_uid_and_gid: bool,
     pub(super) allow_gnu_extensions_without_terminator: bool,
     max_gnu_extension_size: u64,
+    allow_gnu_sparse: bool,
+    max_gnu_sparse_map_size: u64,
 }
 
 impl Default for StreamPolicy {
@@ -466,6 +559,8 @@ impl Default for StreamPolicy {
             allow_pax_base256_uid_and_gid: false,
             allow_gnu_extensions_without_terminator: false,
             max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
+            allow_gnu_sparse: false,
+            max_gnu_sparse_map_size: DEFAULT_MAX_GNU_SPARSE_MAP_SIZE,
         }
     }
 }
@@ -557,6 +652,35 @@ impl StreamPolicy {
     /// GNU extension member. Setting it to [`u64::MAX`] removes the per-extension bound.
     pub fn max_gnu_extension_size(mut self, max_gnu_extension_size: u64) -> Self {
         self.max_gnu_extension_size = max_gnu_extension_size;
+        self
+    }
+
+    /// Configures whether GNU sparse members may be framed.
+    ///
+    /// This accepts old GNU sparse members (typeflag `'S'`) and pax members
+    /// with sparse format 0.1 or 1.0 records, and is disabled by default.
+    /// Sparse map blocks are emitted as [`DataOwner::SparseMap`] data frames,
+    /// and the completed [`SparseMap`] is exposed by
+    /// [`HeaderFrame::sparse_map`] or [`DataFrame::completed_sparse_map`].
+    ///
+    /// When disabled, typeflag `'S'` is unsupported and `GNU.sparse.*` pax
+    /// records are uninterpreted vendor records. When enabled, `GNU.sparse.*`
+    /// records must form a supported sparse format and cannot appear in a
+    /// global pax header.
+    pub fn allow_gnu_sparse(mut self, allow: bool) -> Self {
+        self.allow_gnu_sparse = allow;
+        self
+    }
+
+    /// Configures the maximum size of a GNU sparse map stored after a member header.
+    ///
+    /// This bounds the old GNU sparse extension blocks and the pax 1.0 map
+    /// blocks of each member, counted in whole blocks. A larger map is
+    /// rejected once the limit is exceeded. Map entries within an old GNU
+    /// header or a pax 0.1 record are bounded by the header and pax extension
+    /// limits instead.
+    pub fn max_gnu_sparse_map_size(mut self, max_gnu_sparse_map_size: u64) -> Self {
+        self.max_gnu_sparse_map_size = max_gnu_sparse_map_size;
         self
     }
 }
@@ -813,6 +937,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             State::AwaitingGnuMember { .. } => FrameErrorInner::UnexpectedEof {
                 expected: "ordinary GNU member header after a GNU extension",
             },
+            State::ReadingSparseMap { map, .. } => match map.remaining_payload() {
+                Some(remaining) => FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::SparseMap,
+                    remaining,
+                },
+                None => FrameErrorInner::UnexpectedEof {
+                    expected: "old GNU sparse extension block",
+                },
+            },
             State::ReadingMember { remaining } => FrameErrorInner::TruncatedPayload {
                 owner: DataOwner::Member,
                 remaining: *remaining,
@@ -859,6 +992,19 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                             };
                         }
                         PaxKind::Global => {
+                            // Sparse maps describe one member, and would be
+                            // differential-prone if inherited by later members.
+                            if self.policy.allow_gnu_sparse
+                                && records
+                                    .as_slice()
+                                    .iter()
+                                    .any(|record| sparse_record(record).is_some())
+                            {
+                                return Err(FrameError::invalid_sparse_map(
+                                    header_position,
+                                    "GNU sparse records cannot appear in a global pax header",
+                                ));
+                            }
                             self.global_pax_records.apply(&records);
                             self.state = State::AwaitingHeader;
                         }
@@ -883,6 +1029,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     len,
                     owner: DataOwner::Pax(kind),
                     completed_pax_extension,
+                    completed_sparse_map: None,
                 })))
             }
             State::AwaitingUstarHeader { records } => {
@@ -926,6 +1073,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     len,
                     owner: DataOwner::Gnu(kind),
                     completed_pax_extension: None,
+                    completed_sparse_map: None,
                 })))
             }
             State::AwaitingGnuMember { pending } => {
@@ -940,6 +1088,37 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 self.process_gnu_header(position, block, parsed, pending)
                     .map(Some)
             }
+            State::ReadingSparseMap {
+                header_position,
+                map,
+            } => {
+                let len = map.block_len();
+                let completed_sparse_map = match map.consume(
+                    header_position,
+                    &block,
+                    self.policy.max_gnu_sparse_map_size,
+                )? {
+                    SparseProgress::Pending(map) => {
+                        self.state = State::ReadingSparseMap {
+                            header_position,
+                            map,
+                        };
+                        None
+                    }
+                    SparseProgress::Complete { map, remaining } => {
+                        self.state = State::for_member_payload(remaining);
+                        Some(Arc::new(map))
+                    }
+                };
+                Ok(Some(Frame::Data(DataFrame {
+                    position,
+                    block,
+                    len,
+                    owner: DataOwner::SparseMap,
+                    completed_pax_extension: None,
+                    completed_sparse_map,
+                })))
+            }
             State::ReadingMember { mut remaining } => {
                 let len = remaining.min(BLOCK_SIZE as u64) as usize;
                 remaining -= len as u64;
@@ -950,6 +1129,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     len,
                     owner: DataOwner::Member,
                     completed_pax_extension: None,
+                    completed_sparse_map: None,
                 })))
             }
             State::AwaitingSecondZero => {
@@ -1102,7 +1282,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         parsed: ParsedHeader,
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
-        let frame = HeaderFrame::ustar(
+        let header = HeaderFrame::ustar(
             position,
             block,
             parsed.size,
@@ -1110,8 +1290,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             &self.global_pax_records,
             &self.policy,
         )?;
-        self.state = State::for_member_payload(frame.effective_size);
-        Ok(Frame::Header(frame))
+        self.enter_member(header)
     }
 
     fn process_gnu_header(
@@ -1169,14 +1348,34 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }));
         }
 
-        let frame = HeaderFrame::gnu(
+        let header = HeaderFrame::gnu(
             position,
             block,
             parsed.size,
             pending.long_link,
             &self.policy,
         )?;
-        self.state = State::for_member_payload(frame.effective_size);
+        self.enter_member(header)
+    }
+
+    /// Emits an ordinary member header and enters its sparse map or payload state.
+    fn enter_member(
+        &mut self,
+        (frame, sparse_map): HeaderWithSparseMap,
+    ) -> Result<Frame, FrameError> {
+        self.state = match sparse_map {
+            Some(map) if map.remaining_payload() == Some(0) => {
+                return Err(FrameError::invalid_sparse_map(
+                    frame.position,
+                    "member payload does not contain its map",
+                ));
+            }
+            Some(map) => State::ReadingSparseMap {
+                header_position: frame.position,
+                map,
+            },
+            None => State::for_member_payload(frame.effective_size),
+        };
         Ok(Frame::Header(frame))
     }
 }
@@ -1362,9 +1561,10 @@ impl UstarKind {
     fn from_header(
         position: u64,
         block: &Block,
+        typeflag: u8,
         has_extended_target: bool,
     ) -> Result<Self, FrameError> {
-        let kind = Self::try_from_framed(position, block[TYPEFLAG_OFFSET])?;
+        let kind = Self::try_from_framed(position, typeflag)?;
         match kind {
             Self::HardLink | Self::SymbolicLink => Ok(kind),
             _ if has_extended_target || block[LINK_NAME_RANGE.start] != 0 => Err(FrameError::at(
@@ -1441,10 +1641,12 @@ mod tests {
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
-        header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
+        header::{DEVMAJOR_RANGE, DEVMINOR_RANGE, encode_octal},
+        sparse::SparseFormat,
         test_support::{
             ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
-            collect_frames, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
+            collect_frames, gnu_base256_header, gnu_header, header, raw_record, ready, record,
+            set_checksum,
         },
     };
 
@@ -2503,5 +2705,126 @@ mod tests {
             })
         ));
         assert!(matches!(ready(stream.next_frame()), Ok(None)));
+    }
+
+    fn collect_sparse(bytes: Vec<u8>) -> Vec<Result<Frame, FrameError>> {
+        ready(collect_frames(
+            TarStream::new(ChunkedReader::new(bytes, 13))
+                .with_policy(StreamPolicy::default().allow_gnu_sparse(true)),
+        ))
+    }
+
+    fn set_old_gnu_sparse_entries(block: &mut Block, start: usize, entries: &[(u64, u64)]) {
+        for (index, (offset, length)) in entries.iter().enumerate() {
+            let field = start + index * 24;
+            assert!(encode_octal(&mut block[field..field + 12], *offset));
+            assert!(encode_octal(&mut block[field + 12..field + 24], *length));
+        }
+    }
+
+    #[test]
+    fn frames_old_gnu_sparse_extension_blocks_before_member_data() {
+        let entries = (0..6).map(|index| (index * 100, 10)).collect::<Vec<_>>();
+        let mut sparse_header = gnu_header(b'S', 60);
+        set_old_gnu_sparse_entries(&mut sparse_header, 386, &entries[..4]);
+        sparse_header[482] = 1;
+        assert!(encode_octal(&mut sparse_header[483..495], 600));
+        set_checksum(&mut sparse_header);
+        let mut extension = [0; BLOCK_SIZE];
+        set_old_gnu_sparse_entries(&mut extension, 0, &entries[4..]);
+
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &sparse_header);
+        append_block(&mut bytes, &extension);
+        append_payload(&mut bytes, &[b'd'; 60]);
+        append_terminator(&mut bytes);
+
+        let frames = collect_sparse(bytes.clone());
+        assert_eq!(frames.len(), 3);
+        let header = header_frame(&frames, 0);
+        assert_eq!(header.kind, UstarKind::Regular);
+        assert_eq!(header.effective_size, 60);
+        assert!(header.sparse_map().is_none());
+        let map_block = data_frame(&frames, 1);
+        assert_eq!(map_block.owner, DataOwner::SparseMap);
+        assert_eq!(map_block.len, BLOCK_SIZE);
+        let map = map_block
+            .completed_sparse_map()
+            .expect("final map block should complete the map");
+        assert_eq!(map.format(), SparseFormat::OldGnu);
+        assert_eq!(map.real_size(), 600);
+        assert_eq!(map.stored_size(), 60);
+        assert_eq!(map.entries().len(), 6);
+        let data = data_frame(&frames, 2);
+        assert_eq!((data.owner, data.len), (DataOwner::Member, 60));
+
+        // Without the opt-in, typeflag `S` remains unsupported.
+        assert!(matches!(
+            last_error_inner(&collect(bytes, BLOCK_SIZE)),
+            FrameErrorInner::UnsupportedTypeflag { typeflag: b'S' }
+        ));
+    }
+
+    #[test]
+    fn frames_pax_sparse_maps() {
+        let mut local = raw_record(b"GNU.sparse.size", b"600");
+        local.extend_from_slice(&raw_record(b"GNU.sparse.numblocks", b"1"));
+        local.extend_from_slice(&raw_record(b"GNU.sparse.map", b"100,10"));
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'0', &[b'd'; 10]);
+        append_terminator(&mut bytes);
+
+        let frames = collect_sparse(bytes);
+        let header = header_frame(&frames, 2);
+        assert_eq!(header.effective_size, 10);
+        let map = header
+            .sparse_map()
+            .expect("pax 0.1 header should complete the map");
+        assert_eq!(map.format(), SparseFormat::Pax0_1);
+        assert_eq!(map.real_size(), 600);
+        assert_eq!(data_frame(&frames, 3).owner, DataOwner::Member);
+
+        let mut local = raw_record(b"GNU.sparse.major", b"1");
+        local.extend_from_slice(&raw_record(b"GNU.sparse.minor", b"0"));
+        local.extend_from_slice(&raw_record(b"GNU.sparse.realsize", b"600"));
+        let mut payload = b"1\n100\n10\n".to_vec();
+        payload.resize(BLOCK_SIZE, 0);
+        payload.extend_from_slice(&[b'd'; 10]);
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'0', &payload);
+        append_terminator(&mut bytes);
+
+        let frames = collect_sparse(bytes.clone());
+        assert_eq!(frames.len(), 5);
+        let header = header_frame(&frames, 2);
+        // The pax 1.0 map is part of the physical member payload.
+        assert_eq!(header.effective_size, BLOCK_SIZE as u64 + 10);
+        assert!(header.sparse_map().is_none());
+        let map_block = data_frame(&frames, 3);
+        assert_eq!(map_block.owner, DataOwner::SparseMap);
+        let map = map_block
+            .completed_sparse_map()
+            .expect("final map block should complete the map");
+        assert_eq!(map.format(), SparseFormat::Pax1_0);
+        assert_eq!(map.stored_size(), 10);
+        let data = data_frame(&frames, 4);
+        assert_eq!((data.owner, data.len), (DataOwner::Member, 10));
+
+        // Without the opt-in, the map is ordinary member data.
+        let frames = collect(bytes, BLOCK_SIZE);
+        assert_eq!(data_frame(&frames, 3).owner, DataOwner::Member);
+    }
+
+    #[test]
+    fn rejects_old_gnu_sparse_typeflag_in_pax_archives() {
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'S', 0));
+        append_terminator(&mut bytes);
+        assert!(matches!(
+            last_error_inner(&collect_sparse(bytes)),
+            FrameErrorInner::UnsupportedTypeflag { typeflag: b'S' }
+        ));
     }
 }

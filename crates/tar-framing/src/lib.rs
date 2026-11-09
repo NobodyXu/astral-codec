@@ -5,6 +5,8 @@
 //! - [`stream`] is a low-level, lossless per-block framing API.
 //! - [`logical`] is a medium-level, assembled member reader API.
 //!
+//! [`sparse`] describes the GNU sparse maps that both APIs can expose.
+//!
 //! [`stream`] provides the basic static machine enforcement for a tar
 //! stream, including ensuring that any given stream is either strictly
 //! pax *or* GNU and not a mix of the two. [`logical`] is layered on top
@@ -65,6 +67,11 @@
 //!   these as regular files (i.e. assuming their size is a physical size), but this has marginal
 //!   benefit in practice.
 //!
+//! - tar-framing interprets the `GNU.sparse.*` vendor records of GNU's pax sparse
+//!   formats 0.1 and 1.0 only when [`StreamPolicy::allow_gnu_sparse`] is enabled.
+//!   Format 0.0 is always rejected in that mode, because it repeats records within
+//!   one extended header. See [`sparse`] for details.
+//!
 //! - tar-framing rejects `hdrcharset` pax records that aren't UTF-8 or `BINARY`. pax says
 //!   that "additional names may be agreed between the originator and the recipient," but
 //!   we are the recipient and we don't accept any other `hdrcharset` names.
@@ -80,9 +87,11 @@
 //! - The GNU "longname" and "longlink" (`'L'` and `'K'`) typeflags are supported,
 //!   with similar path-precedence semantics as their pax record equivalents.
 //!
+//! - Old GNU sparse files (`'S'`) are supported only when
+//!   [`StreamPolicy::allow_gnu_sparse`] is enabled. See [`sparse`] for details.
+//!
 //! - Other GNU-specific typeflags are **not** supported whatsoever, and produce
-//!   a framing error. This includes sparse files (`'S'`) and multivolume headers
-//!   (`'M'`).
+//!   a framing error. This includes multivolume headers (`'M'`).
 //!
 //! - tar-framing accepts the GNU-specific "base-256" encoding for numbers, but rejects
 //!   negative encodings as well as any value that would exceed the precision of a `u64`.
@@ -145,6 +154,7 @@ mod error;
 pub mod header;
 pub mod logical;
 mod pax;
+pub mod sparse;
 pub mod stream;
 #[cfg(test)]
 mod test_support;
@@ -176,6 +186,11 @@ pub const DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE: u64 = 4 * DEFAULT_MAX_PAX_EXTE
 ///
 /// This is 128 KiB.
 pub const DEFAULT_MAX_GNU_EXTENSION_SIZE: u64 = 128 * 1024;
+
+/// The default maximum size in bytes of the GNU sparse map blocks of one member.
+///
+/// This is 256 KiB.
+pub const DEFAULT_MAX_GNU_SPARSE_MAP_SIZE: u64 = 256 * 1024;
 
 /// A single tar block.
 pub type Block = [u8; BLOCK_SIZE];

@@ -4,15 +4,16 @@
 //! they describe. Each member carries a compact borrowed [`Header`], and each
 //! PAX member carries one unified [`PaxState`].
 
-use std::mem;
+use std::{mem, sync::Arc};
 
 use tokio::io::AsyncRead;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKind, PaxValue, StreamPolicy,
-    UstarKind,
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
+    PaxValue, StreamPolicy, UstarKind,
     header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
+    sparse::{SharedSparseMap, SparseMap},
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, State, TarStream},
 };
 
@@ -99,6 +100,9 @@ pub struct Header<'a> {
     /// This is also the number of payload bytes exposed through
     /// [`MemberPayload`]. Member kinds that cannot carry payload are rejected
     /// when either their declared or effective size is nonzero.
+    ///
+    /// For a sparse member, this is [`SparseMap::stored_size`]: the stored
+    /// data bytes, excluding any sparse map in the physical payload.
     pub effective_size: u64,
     /// Permission and mode bits decoded from the ordinary header, if present.
     ///
@@ -137,6 +141,12 @@ pub struct Header<'a> {
     ///
     /// Applicable pax records may override or delete this fallback.
     pub gname: &'a [u8],
+    /// The GNU sparse map of this member, if it is a sparse file.
+    ///
+    /// Sparse members are only framed when
+    /// [`StreamPolicy::allow_gnu_sparse`] is enabled. [`MemberPayload`]
+    /// yields the stored data regions; holes between them are not stored.
+    pub sparse_map: Option<&'a SparseMap>,
     header_path: &'a [u8],
     link_name: &'a [u8],
 }
@@ -170,6 +180,23 @@ impl<R> MemberFrame<'_, R> {
     /// and paths containing embedded NUL bytes are also rejected.
     pub fn effective_path(&self) -> Result<&[u8], FrameError> {
         let path = match &self.extensions {
+            // GNU tar renames sparse pax members and stores their original name
+            // in `GNU.sparse.name`, which takes precedence over `path`.
+            MemberExtensions::Pax(state)
+                if self.header.sparse_map.is_some()
+                    && let Some(PaxRecord::Vendor { value, .. }) =
+                        state.effective_record(&sparse_name_keyword()) =>
+            {
+                match value {
+                    PaxValue::Value(value) => value.as_ref(),
+                    PaxValue::Deleted => {
+                        return Err(FrameError::deleted_pax_record(
+                            self.header.position,
+                            "GNU.sparse.name",
+                        ));
+                    }
+                }
+            }
             MemberExtensions::Pax(state) => match state.path() {
                 Some(PaxValue::Value(path)) => path.as_bytes(),
                 Some(PaxValue::Deleted) => {
@@ -260,6 +287,8 @@ struct PendingExtensions {
     local_pax: Option<PaxExtension>,
     gnu_long_name: Option<GnuExtension>,
     gnu_long_link: Option<GnuExtension>,
+    /// A sparse member header whose map blocks have not all been read.
+    sparse_header: Option<HeaderFrame>,
 }
 
 impl PendingExtensions {
@@ -304,9 +333,25 @@ impl PendingExtensions {
                     .payload
                     .extend_from_slice(&frame.block[..frame.len]);
             }
-            DataOwner::Member => return Err(unattached()),
+            DataOwner::Member | DataOwner::SparseMap => return Err(unattached()),
         }
         Ok(())
+    }
+
+    /// Attaches a completed sparse map to its pending member header.
+    fn push_sparse_map(&mut self, frame: DataFrame) -> Result<Option<HeaderFrame>, FrameError> {
+        let Some(header) = self.sparse_header.as_mut() else {
+            return Err(FrameError::unexpected_order(
+                frame.position,
+                "sparse member header",
+                "unattached sparse map data",
+            ));
+        };
+        let Some(map) = frame.completed_sparse_map else {
+            return Ok(None);
+        };
+        header.sparse_map = Some(map);
+        Ok(self.sparse_header.take())
     }
 
     fn into_member_extensions(
@@ -334,6 +379,7 @@ struct HeaderStorage {
     link_name: Vec<u8>,
     uname: Vec<u8>,
     gname: Vec<u8>,
+    sparse_map: Option<SharedSparseMap>,
 }
 
 impl HeaderStorage {
@@ -344,18 +390,21 @@ impl HeaderStorage {
             .clone_into(&mut self.link_name);
         frame.string_field(UNAME_RANGE).clone_into(&mut self.uname);
         frame.string_field(GNAME_RANGE).clone_into(&mut self.gname);
+        self.sparse_map.clone_from(&frame.sparse_map);
+        let sparse_map = self.sparse_map.as_deref();
         Header {
             position: frame.position,
             format: frame.format,
             kind: frame.kind,
             declared_size: frame.declared_size,
-            effective_size: frame.effective_size,
+            effective_size: sparse_map.map_or(frame.effective_size, SparseMap::stored_size),
             mode: frame.mode,
             uid: frame.uid,
             gid: frame.gid,
             mtime: frame.mtime,
             uname: &self.uname,
             gname: &self.gname,
+            sparse_map,
             header_path: &self.path,
             link_name: &self.link_name,
         }
@@ -425,7 +474,19 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                         payload: Vec::new(),
                     });
                 }
+                Frame::Data(frame) if frame.owner == DataOwner::SparseMap => {
+                    if let Some(header) = pending.push_sparse_map(frame)? {
+                        return Ok(Some(header));
+                    }
+                }
                 Frame::Data(frame) => pending.push_data(frame, &mut self.global_pax_records)?,
+                // A sparse map that continues after its header must be read
+                // before the member payload.
+                Frame::Header(header)
+                    if matches!(self.payload.stream.state, State::ReadingSparseMap { .. }) =>
+                {
+                    pending.sparse_header = Some(header);
+                }
                 Frame::Header(header) => return Ok(Some(header)),
             }
         }
@@ -482,6 +543,13 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     /// Discards and validates all remaining payload bytes using reusable storage.
     pub async fn skip(self) -> Result<(), FrameError> {
         self.reader.drain_payload().await
+    }
+}
+
+fn sparse_name_keyword() -> PaxKeyword {
+    PaxKeyword::Vendor {
+        vendor: Arc::from("GNU"),
+        name: Arc::from("sparse.name"),
     }
 }
 
@@ -1106,6 +1174,54 @@ mod tests {
             ready_ok(async {
                 let member = next_member(&mut reader).await?;
                 assert_eq!(member.effective_path()?, long_name);
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn retains_pending_sparse_header_across_cancelled_reads() {
+        let mut local = record("GNU.sparse.major", "1");
+        local.extend_from_slice(&record("GNU.sparse.minor", "0"));
+        local.extend_from_slice(&record("GNU.sparse.name", "sparse"));
+        local.extend_from_slice(&record("GNU.sparse.realsize", "1000"));
+        // One hundred one-byte regions need a map spanning two blocks.
+        let mut payload = b"100\n".to_vec();
+        for index in 0..100 {
+            payload.extend_from_slice(format!("{}\n1\n", index * 10).as_bytes());
+        }
+        assert!(payload.len() > BLOCK_SIZE);
+        payload.resize(2 * BLOCK_SIZE, 0);
+        payload.extend_from_slice(&[b'd'; 100]);
+
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &local);
+        let header_position = bytes.len();
+        append_pax(&mut bytes, b'0', &payload);
+        append_terminator(&mut bytes);
+
+        let policy = StreamPolicy::default().allow_gnu_sparse(true);
+        for position in [
+            header_position + BLOCK_SIZE,
+            header_position + 2 * BLOCK_SIZE,
+        ] {
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes.clone(), position))
+                .with_policy(policy);
+            cancel_pending(reader.next_frame());
+
+            ready_ok(async {
+                let mut member = next_member(&mut reader).await?;
+                assert_eq!(member.effective_path()?, b"sparse");
+                assert_eq!(member.header.position, header_position as u64);
+                assert_eq!(member.header.effective_size, 100);
+                let map = member.header.sparse_map.expect("expected sparse map");
+                assert_eq!(map.entries().len(), 100);
+                let block = member
+                    .payload
+                    .next_block()
+                    .await?
+                    .expect("expected stored data");
+                assert_eq!(&block.block[..block.len], [b'd'; 100]);
                 Ok(())
             });
         }
