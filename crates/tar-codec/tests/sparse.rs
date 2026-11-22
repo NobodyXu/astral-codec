@@ -220,7 +220,12 @@ fn set_octal(field: &mut [u8], value: u64) {
 }
 
 fn set_entries(entries_field: &mut [u8], entries: &[SparseEntry]) {
-    for (field, entry) in entries_field.chunks_exact_mut(24).zip(entries) {
+    for (field, entry) in entries_field
+        .as_chunks_mut::<24>()
+        .0
+        .iter_mut()
+        .zip(entries)
+    {
         set_octal(&mut field[..12], entry.offset);
         set_octal(&mut field[12..], entry.length);
     }

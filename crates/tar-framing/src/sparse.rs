@@ -595,7 +595,7 @@ fn parse_old_gnu_entries(
         }
     };
     let mut ended = false;
-    for entry in bytes.chunks_exact(OLD_GNU_ENTRY_SIZE) {
+    for entry in bytes.as_chunks::<OLD_GNU_ENTRY_SIZE>().0 {
         if is_all_nul(entry) {
             ended = true;
         } else if ended {
