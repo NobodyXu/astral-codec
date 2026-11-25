@@ -334,6 +334,69 @@ async fn decodes_sparse_files_into_their_expanded_contents() -> TestResult {
     Ok(())
 }
 
+/// Mirrors the pax 1.0 members that macOS bsdtar writes for sparse release
+/// binaries: a `mtime` record before the sparse records, no
+/// `GNU.sparse.size`, a `GNUSparseFile.0` placeholder path, a map without a
+/// trailing empty entry, and other members before and after the sparse one.
+#[tokio::test]
+async fn decodes_bsdtar_pax_1_0_members() -> TestResult {
+    let file = SparseFile::new(
+        40_000,
+        &[
+            (0, 4_096),
+            (12_288, 1_000),
+            (20_480, 4_096),
+            (32_768, 7_232),
+        ],
+    );
+    let records = [
+        pax_record(PaxKeyword::Mtime, "1648302026.740739663"),
+        sparse_record("major", "1"),
+        sparse_record("minor", "0"),
+        sparse_record("name", "./pkg/bin"),
+        sparse_record("realsize", &file.real_size().to_string()),
+    ]
+    .concat();
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .ustar("./pkg/", b'5', b"", "", 0o755)
+        .ustar("./pkg/README", b'0', b"readme", "", 0o644)
+        .pax(b'x', &records)
+        .ustar(
+            "./pkg/GNUSparseFile.0/bin",
+            b'0',
+            &file.pax_1_0_payload(),
+            "",
+            0o755,
+        )
+        .ustar("./pkg/LICENSE", b'0', b"license", "", 0o644);
+    let bytes = archive.finish();
+
+    let mut members = TarArchive::new(bytes.as_slice())
+        .with_policy(sparse_policy())
+        .members();
+    let mut files = Vec::new();
+    while let Some(member) = members.next().await? {
+        if let Member::File {
+            metadata,
+            size,
+            payload,
+            ..
+        } = member
+        {
+            let contents = read_payload(payload).await?;
+            assert_eq!(size, contents.len() as u64, "{}", metadata.path);
+            files.push((metadata.path.to_string(), contents));
+        }
+    }
+    assert_eq!(files.len(), 3);
+    assert_eq!(files[0], ("./pkg/README".to_owned(), b"readme".to_vec()));
+    assert_eq!(files[1].0, "./pkg/bin");
+    assert!(files[1].1 == file.contents, "expanded contents differ");
+    assert_eq!(files[2], ("./pkg/LICENSE".to_owned(), b"license".to_vec()));
+    Ok(())
+}
+
 /// A reader that returns [`Poll::Pending`] before every short read.
 struct InterruptingReader {
     bytes: Vec<u8>,
