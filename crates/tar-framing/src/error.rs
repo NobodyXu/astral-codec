@@ -37,6 +37,10 @@ impl FrameError {
         )
     }
 
+    pub(crate) fn invalid_sparse_map(position: u64, reason: &'static str) -> Self {
+        Self::at(position, FrameErrorInner::InvalidSparseMap { reason })
+    }
+
     pub(crate) fn invalid_pax_record(position: u64, source: PaxError) -> Self {
         Self::at(position, FrameErrorInner::InvalidPaxRecord { source })
     }
@@ -169,6 +173,24 @@ pub enum FrameErrorInner {
         kind: GnuKind,
         /// The reason the metadata value was rejected.
         reason: &'static str,
+    },
+    /// A GNU sparse member's map or sparse metadata is malformed.
+    #[error("malformed GNU sparse map: {reason}")]
+    InvalidSparseMap {
+        /// The reason the sparse map was rejected.
+        reason: &'static str,
+    },
+    /// A member uses a GNU sparse format version that is not supported.
+    #[error("unsupported GNU sparse format version {version}")]
+    UnsupportedSparseFormat {
+        /// The declared or inferred sparse format version.
+        version: String,
+    },
+    /// A GNU sparse map occupies more blocks than the configured limit.
+    #[error("GNU sparse map exceeds configured limit of {limit} bytes")]
+    SparseMapTooLarge {
+        /// The configured maximum sparse map size.
+        limit: u64,
     },
     /// A pax record removed metadata required to interpret a member.
     #[error("pax metadata {keyword:?} deletes a required member field")]

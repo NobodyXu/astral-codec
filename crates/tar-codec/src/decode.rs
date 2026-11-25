@@ -12,15 +12,17 @@ use archive_trait::{
     SpecialKind,
 };
 use tar_framing::{
-    FrameError, PaxExtension, PaxKeyword, PaxKind, PaxRecord, PaxValue, StreamPolicy, UstarKind,
+    BLOCK_SIZE, FrameError, PaxExtension, PaxKeyword, PaxKind, PaxRecord, PaxValue, StreamPolicy,
+    UstarKind,
     logical::{MemberExtensions, MemberFrame, MemberPayload as FramingMemberPayload, TarReader},
+    sparse::SparseMap,
 };
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
 pub use tar_framing::{
     DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE,
-    DEFAULT_MAX_PAX_EXTENSION_SIZE, TrailingDataPolicy,
+    DEFAULT_MAX_GNU_SPARSE_MAP_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, TrailingDataPolicy,
 };
 
 /// This type reads one structurally valid pax or GNU tar archive in one pass.
@@ -66,7 +68,9 @@ impl<R> TarArchive<R> {
             )
             .allow_gnu_extensions_without_terminator(policy.allow_gnu_extensions_without_terminator)
             .allow_pax_base256_uid_and_gid(policy.pax_policy.allow_base256_uid_and_gid)
-            .max_gnu_extension_size(policy.max_gnu_extension_size);
+            .max_gnu_extension_size(policy.max_gnu_extension_size)
+            .allow_gnu_sparse(policy.allow_gnu_sparse)
+            .max_gnu_sparse_map_size(policy.max_gnu_sparse_map_size);
         self.reader = self.reader.with_policy(stream_policy);
         self.policy = policy;
         self
@@ -84,6 +88,8 @@ pub struct DecodePolicy {
     allow_header_uname_and_gname_without_terminator: bool,
     allow_gnu_extensions_without_terminator: bool,
     max_gnu_extension_size: u64,
+    allow_gnu_sparse: bool,
+    max_gnu_sparse_map_size: u64,
     pax_policy: PaxDecodePolicy,
 }
 
@@ -163,6 +169,8 @@ impl Default for DecodePolicy {
             allow_header_uname_and_gname_without_terminator: false,
             allow_gnu_extensions_without_terminator: false,
             max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
+            allow_gnu_sparse: false,
+            max_gnu_sparse_map_size: DEFAULT_MAX_GNU_SPARSE_MAP_SIZE,
             pax_policy: PaxDecodePolicy::default(),
         }
     }
@@ -231,6 +239,38 @@ impl DecodePolicy {
         self
     }
 
+    /// Configures whether GNU sparse files may be decoded.
+    ///
+    /// This accepts old GNU sparse members (typeflag `'S'`) and pax members
+    /// using GNU sparse format 0.1 or 1.0. The pax sparse format 0.0 is always
+    /// rejected, because it repeats records within one extended header.
+    ///
+    /// A decoded sparse file's payload yields its expanded contents, with
+    /// zero bytes for each hole, and its size is the expanded size. For pax
+    /// sparse members, `GNU.sparse.name` takes precedence over `path`.
+    /// The `GNU.sparse.*` records that describe a sparse member are interpreted
+    /// rather than subject to [`PaxDecodePolicy::vendor_extension_policy`].
+    ///
+    /// This is **disabled by default**, because the expanded size is not
+    /// bounded by the archive size: a small archive can describe an
+    /// arbitrarily large file of holes. When disabled, typeflag `'S'` is
+    /// rejected and `GNU.sparse.*` records are uninterpreted vendor records.
+    pub fn allow_gnu_sparse(mut self, allow: bool) -> Self {
+        self.allow_gnu_sparse = allow;
+        self
+    }
+
+    /// Configures the maximum size of the GNU sparse map blocks of one member.
+    ///
+    /// This bounds the old GNU sparse extension blocks and the pax 1.0 map
+    /// at the start of a member payload, counted in whole blocks. The default
+    /// is [`DEFAULT_MAX_GNU_SPARSE_MAP_SIZE`]. It has no effect unless
+    /// [`Self::allow_gnu_sparse`] is enabled.
+    pub fn max_gnu_sparse_map_size(mut self, max_gnu_sparse_map_size: u64) -> Self {
+        self.max_gnu_sparse_map_size = max_gnu_sparse_map_size;
+        self
+    }
+
     /// Configures the accepted pax feature subset.
     pub fn pax_policy(mut self, policy: PaxDecodePolicy) -> Self {
         self.pax_policy = policy;
@@ -240,8 +280,12 @@ impl DecodePolicy {
     fn check_member<R>(&self, frame: &MemberFrame<'_, R>) -> Result<(), DecodeError> {
         match &frame.extensions {
             MemberExtensions::Pax(state) => {
+                // Framing has interpreted and validated the `GNU.sparse.*`
+                // records in a sparse member's local extension.
+                let sparse = frame.header.sparse_map.is_some();
                 for extension in state.extensions() {
-                    self.pax_policy.check_extension(extension)?;
+                    self.pax_policy
+                        .check_extension(extension, sparse && extension.kind == PaxKind::Local)?;
                 }
             }
             MemberExtensions::Gnu {
@@ -332,7 +376,8 @@ impl PaxDecodePolicy {
     /// This can produce output that differs from the archive's intended
     /// contents. For example, `GNU.sparse.*` records can change a member's
     /// effective name, logical size, and mapping from stored payload bytes to
-    /// file contents; these semantics are ignored when this option is enabled.
+    /// file contents; these semantics are ignored when this option is enabled,
+    /// unless [`DecodePolicy::allow_gnu_sparse`] is also enabled.
     ///
     /// **IMPORTANT**: Only permit records whose ignored semantics are
     /// acceptable. Unknown vendor-namespaced pax records are **forbidden by
@@ -386,7 +431,11 @@ impl PaxDecodePolicy {
         self
     }
 
-    fn check_extension(&self, extension: &PaxExtension) -> Result<(), DecodeError> {
+    /// Checks the records of one pax extension.
+    ///
+    /// When `sparse` is set, the extension's `GNU.sparse.*` records describe a
+    /// sparse member and are not unknown vendor records.
+    fn check_extension(&self, extension: &PaxExtension, sparse: bool) -> Result<(), DecodeError> {
         let position = extension.position;
         if extension.kind == PaxKind::Global && !self.allow_global_pax_extensions {
             return Err(DecodeError::policy_violation(
@@ -402,6 +451,7 @@ impl PaxDecodePolicy {
                 name,
                 value,
             } = record
+                && !(sparse && vendor.as_ref() == "GNU" && name.starts_with("sparse."))
             {
                 let allowed = match &self.vendor_extension_policy {
                     PaxVendorExtensionPolicy::RejectUnknown => false,
@@ -532,6 +582,15 @@ pub enum DecodeError {
         /// The selected policy rule that rejected the feature.
         violation: DecodePolicyViolation,
     },
+    /// A sparse member's stored data ended before its sparse map was satisfied.
+    ///
+    /// Framing validates each sparse map against the stored data size, so
+    /// this indicates an internal inconsistency rather than a malformed archive.
+    #[error("at byte {position}: sparse member data ended before its map was satisfied")]
+    TruncatedSparseData {
+        /// Source header position of the sparse member.
+        position: u64,
+    },
     /// An earlier decoding operation failed.
     #[error("tar reader is poisoned after a decoding error")]
     Poisoned,
@@ -547,9 +606,93 @@ impl DecodeError {
 }
 
 /// A tar member payload adapted to [`MemberPayloadTrait`].
+///
+/// A sparse file's payload yields its expanded contents.
 pub struct TarMemberPayload<'a, R> {
     payload: FramingMemberPayload<'a, R>,
+    sparse: Option<SparseExpansion<'a>>,
     poisoned: &'a mut bool,
+}
+
+/// The progress of expanding a sparse member's stored data regions.
+struct SparseExpansion<'a> {
+    position: u64,
+    map: &'a SparseMap,
+    /// The index of the first map entry that does not end before `offset`.
+    entry: usize,
+    /// The number of expanded bytes already yielded.
+    offset: u64,
+    /// Stored data read from the member payload but not yet yielded.
+    stored: Vec<u8>,
+    stored_start: usize,
+}
+
+impl<'a> SparseExpansion<'a> {
+    fn new(position: u64, map: &'a SparseMap) -> Self {
+        Self {
+            position,
+            map,
+            entry: 0,
+            offset: 0,
+            stored: Vec::new(),
+            stored_start: 0,
+        }
+    }
+
+    async fn next_chunk<R: AsyncRead + Unpin>(
+        &mut self,
+        payload: &mut FramingMemberPayload<'_, R>,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<bool, DecodeError> {
+        let target_len = target_len.max(BLOCK_SIZE);
+        loop {
+            let (start, end) = match self.map.entries().get(self.entry) {
+                Some(entry) => (entry.offset, entry.offset + entry.length),
+                None => (self.map.real_size(), self.map.real_size()),
+            };
+            if self.offset < start {
+                // A hole before the next stored region, or at the end of the file.
+                let len = (start - self.offset).min(target_len as u64);
+                buffer.clear();
+                buffer.resize(len as usize, 0);
+                self.offset += len;
+                return Ok(true);
+            }
+            if self.offset == end {
+                if self.entry == self.map.entries().len() {
+                    return Ok(false);
+                }
+                self.entry += 1;
+                continue;
+            }
+
+            if self.stored_start == self.stored.len() {
+                // Reset first: a cancelled read may take the buffer's contents.
+                self.stored.clear();
+                self.stored_start = 0;
+                if !payload.next_chunk(&mut self.stored, target_len).await? {
+                    return Err(DecodeError::TruncatedSparseData {
+                        position: self.position,
+                    });
+                }
+            }
+            let available = &self.stored[self.stored_start..];
+            let len = (end - self.offset)
+                .min(target_len as u64)
+                .min(available.len() as u64) as usize;
+            if self.stored_start == 0 && len == available.len() {
+                std::mem::swap(buffer, &mut self.stored);
+                self.stored.clear();
+            } else {
+                buffer.clear();
+                buffer.extend_from_slice(&available[..len]);
+                self.stored_start += len;
+            }
+            self.offset += len as u64;
+            return Ok(true);
+        }
+    }
 }
 
 impl<R: AsyncRead + Unpin> MemberPayloadTrait for TarMemberPayload<'_, R> {
@@ -563,11 +706,19 @@ impl<R: AsyncRead + Unpin> MemberPayloadTrait for TarMemberPayload<'_, R> {
         if *self.poisoned {
             return Err(DecodeError::Poisoned);
         }
-        self.payload
-            .next_chunk(buffer, target_len)
-            .await
-            .inspect_err(|_| *self.poisoned = true)
-            .map_err(Into::into)
+        match &mut self.sparse {
+            Some(sparse) => {
+                sparse
+                    .next_chunk(&mut self.payload, buffer, target_len)
+                    .await
+            }
+            None => self
+                .payload
+                .next_chunk(buffer, target_len)
+                .await
+                .map_err(Into::into),
+        }
+        .inspect_err(|_| *self.poisoned = true)
     }
 
     async fn skip(self) -> Result<(), Self::Error> {
@@ -603,19 +754,28 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
             Err(error) => Err(error.into()),
         }
         .inspect_err(|_| *poisoned = true)?;
-        Ok(member
-            .map(|member| member.map_payload(|payload| TarMemberPayload { payload, poisoned })))
+        Ok(member.map(|member| {
+            member.map_payload(|(payload, sparse)| TarMemberPayload {
+                payload,
+                sparse,
+                poisoned,
+            })
+        }))
     }
 }
+
+/// A member's framing payload and, for a sparse file, its expansion state.
+type DecodedPayload<'a, R> = (FramingMemberPayload<'a, R>, Option<SparseExpansion<'a>>);
 
 fn decode_member<'a, R>(
     frame: MemberFrame<'a, R>,
     policy: &DecodePolicy,
-) -> Result<Member<FramingMemberPayload<'a, R>>, DecodeError> {
+) -> Result<Member<DecodedPayload<'a, R>>, DecodeError> {
     policy.check_member(&frame)?;
     let position = frame.header.position;
     let kind = frame.header.kind;
-    let size = frame.header.effective_size;
+    let sparse_map = frame.header.sparse_map;
+    let size = sparse_map.map_or(frame.header.effective_size, SparseMap::real_size);
     let executable = frame.header.mode.unwrap_or_default() & 0o111 != 0;
     let path = std::str::from_utf8(frame.effective_path()?)
         .map(str::to_owned)
@@ -640,7 +800,10 @@ fn decode_member<'a, R>(
             metadata,
             size,
             executable,
-            payload: frame.payload,
+            payload: (
+                frame.payload,
+                sparse_map.map(|map| SparseExpansion::new(position, map)),
+            ),
         },
         UstarKind::Directory => Member::Directory { metadata },
         UstarKind::SymbolicLink => Member::SymbolicLink { metadata, target },
@@ -648,7 +811,7 @@ fn decode_member<'a, R>(
             metadata,
             target,
             size,
-            payload: frame.payload,
+            payload: (frame.payload, None),
         },
         UstarKind::CharacterDevice => Member::Special {
             metadata,
